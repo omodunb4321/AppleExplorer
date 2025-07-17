@@ -45,7 +45,7 @@ async function importData() {
       // Check for duplicate by ACCESSION
       const existing = await applesCol.findOne({ accession: row["ACCESSION"] });
       if (existing) {
-        console.log(`⚠️ Duplicate found (ACCESSION: ${row['ACCESSION']}) – skipping`);
+        console.log(` Duplicate found (ACCESSION: ${row['ACCESSION']}) – skipping`);
         duplicateLog.push({
           accession: row['ACCESSION'],
           cultivarName: row['CULTIVAR NAME'],
