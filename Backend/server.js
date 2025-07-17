@@ -1,36 +1,79 @@
+// Load environment variables
 require("dotenv").config();
+
+// Modules
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
-const Apple = require("./models/Apple");
-
 const multer = require("multer");
 const csv = require("csv-parser");
 const fs = require("fs");
 const path = require("path");
-const { Parser } = require("json2csv"); 
+const { Parser } = require("json2csv");
+const session = require("express-session");
+const passport = require("passport");
+const Apple = require("./models/Apple");
+const User = require("./models/User");
+require("./config/passport")(passport);
+const authRoutes = require("./routes/auth");
 
 const app = express();
 app.use(cors());
+app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-//tells the server how to handle file uploads (CSV), storing them temporarily my uploads folder
+// Session and Passport setup
+app.use(session({
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false
+}));
+app.use(passport.initialize());
+app.use(passport.session());
+
+// Multer setup for CSV uploads
 const upload = multer({
   dest: "uploads/",
-  limits: { fileSize: 5 * 1024 * 1024 } // 5MB max
+  limits: { fileSize: 5 * 1024 * 1024 }
 });
 
-// Connect to MongoDB
+// MongoDB connection
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB connected"))
   .catch(err => console.error("MongoDB connection error:", err));
+
+// Google OAuth routes
+app.get("/auth/google",
+  passport.authenticate("google", { scope: ["profile", "email"] })
+);
+
+app.get("/auth/google/callback",
+  passport.authenticate("google", { failureRedirect: "/" }),
+  (req, res) => {
+    res.redirect("/dashboard");
+  }
+);
+
+function ensureAuth(req, res, next) {
+  if (req.isAuthenticated()) return next();
+  res.redirect("/LoginPage.html");
+}
+
+function ensureReadOnly(req, res, next) {
+  if (req.user.role === "read-only") return next();
+  res.status(403).send("Access denied");
+}
+
+app.get("/dashboard", ensureAuth, ensureReadOnly, (req, res) => {
+  res.send(`<h1>Welcome, ${req.user.displayName}</h1><p>You have read-only access.</p>`);
+});
 
 // Default route
 app.get("/", (req, res) => {
   res.send(" Apple Explorer API is live!");
 });
 
-// GET apples filters 
+// GET apples with filtering
 app.get("/apples", async (req, res) => {
   try {
     const {
@@ -46,28 +89,13 @@ app.get("/apples", async (req, res) => {
     } = req.query;
 
     const baseFilter = {};
-
     if (cultivarName) baseFilter.cultivarName = { $regex: new RegExp(cultivarName, "i") };
     if (accession) baseFilter.accession = accession;
     if (harvestDate) baseFilter.harvestDate = harvestDate;
 
     const results = await Apple.aggregate([
-      {
-        $lookup: {
-          from: "Origin",
-          localField: "originId",
-          foreignField: "_id",
-          as: "origin"
-        }
-      },
-      {
-        $lookup: {
-          from: "AppleProfile",
-          localField: "appleProfileId",
-          foreignField: "_id",
-          as: "profile"
-        }
-      },
+      { $lookup: { from: "Origin", localField: "originId", foreignField: "_id", as: "origin" } },
+      { $lookup: { from: "AppleProfile", localField: "appleProfileId", foreignField: "_id", as: "profile" } },
       { $unwind: "$origin" },
       { $unwind: "$profile" },
       {
@@ -90,8 +118,7 @@ app.get("/apples", async (req, res) => {
   }
 });
 
-
-// POST a new apple, this just adds single apples 
+// POST a single apple
 app.post("/apples", async (req, res) => {
   try {
     const {
@@ -137,26 +164,55 @@ app.post("/apples", async (req, res) => {
   }
 });
 
-// Upload CSV and import apples/ bulk
-app.post("/apples/upload", upload.single("file"), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: "No file uploaded" });
-  }
+// UPDATE an existing apple by ID
+app.put("/apples/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updated = await Apple.findByIdAndUpdate(id, req.body, {
+      new: true,
+      runValidators: true
+    });
 
-  const results = [];
-  const errors = [];
+    if (!updated) {
+      return res.status(404).json({ error: "Apple not found" });
+    }
+
+    res.json({ message: "Apple updated successfully", data: updated });
+  } catch (err) {
+    console.error("Update error:", err);
+    res.status(500).json({ error: "Failed to update apple" });
+  }
+});
+
+// DELETE an existing apple by ID
+app.delete("/apples/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const deleted = await Apple.findByIdAndDelete(id);
+
+    if (!deleted) {
+      return res.status(404).json({ error: "Apple not found" });
+    }
+
+    res.json({ message: "Apple deleted successfully", data: deleted });
+  } catch (err) {
+    console.error("Delete error:", err);
+    res.status(500).json({ error: "Failed to delete apple" });
+  }
+});
+
+// Upload CSV and import apples
+app.post("/apples/upload", upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+  const results = [], errors = [];
   const filePath = path.join(__dirname, req.file.path);
 
   fs.createReadStream(filePath)
     .pipe(csv())
     .on("data", (row) => {
-      const isValid =
-        row.accession &&
-        row.cultivarName &&
-        row.originId &&
-        row.accession.trim() !== "" &&
-        row.cultivarName.trim() !== "" &&
-        row.originId.trim() !== "";
+      const isValid = row.accession && row.cultivarName && row.originId &&
+                      row.accession.trim() !== "" && row.cultivarName.trim() !== "" && row.originId.trim() !== "";
 
       if (!isValid) {
         errors.push({ row, error: "Missing required fields" });
@@ -174,85 +230,57 @@ app.post("/apples/upload", upload.single("file"), async (req, res) => {
         originId: row.originId.trim()
       });
     })
-.on("end", async () => {
-  const inserted = [];
+    .on("end", async () => {
+      const inserted = [];
 
-  for (const data of results) {
-    const duplicate = await Apple.findOne({
-      $or: [
-        { accession: data.accession },
-        { cultivarName: data.cultivarName }
-      ]
-    });
+      for (const data of results) {
+        const duplicate = await Apple.findOne({
+          $or: [{ accession: data.accession }, { cultivarName: data.cultivarName }]
+        });
 
-    if (!duplicate) {
-      try {
-        const newApple = new Apple(data);
-        await newApple.save();
-        inserted.push(newApple);
-      } catch (err) {
-        errors.push({ row: data, error: "MongoDB error" });
+        if (!duplicate) {
+          try {
+            const newApple = new Apple(data);
+            await newApple.save();
+            inserted.push(newApple);
+          } catch (err) {
+            errors.push({ row: data, error: "MongoDB error" });
+          }
+        } else {
+          errors.push({ row: data, error: "Duplicate accession or cultivarName" });
+        }
       }
-    } else {
-      errors.push({ row: data, error: "Duplicate accession or cultivarName" });
-    }
-  }
-  });
 
-  fs.unlinkSync(filePath); // Delete uploaded file
+      fs.unlinkSync(filePath);
 
-  // Save errors to logs
-  if (errors.length > 0) {
-    const logsDir = path.join(__dirname, "logs");
-    if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir);
+      if (errors.length > 0) {
+        const logsDir = path.join(__dirname, "logs");
+        if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir);
 
-    fs.writeFileSync(
-      path.join(logsDir, "upload_errors.json"),
-      JSON.stringify(errors, null, 2)
-    );
+        fs.writeFileSync(path.join(logsDir, "upload_errors.json"), JSON.stringify(errors, null, 2));
+        const errorFields = ["row.accession", "row.cultivarName", "error"];
+        const errorParser = new Parser({ fields: errorFields, flatten: true });
+        fs.writeFileSync(path.join(logsDir, "upload_errors.csv"), errorParser.parse(errors));
+      }
 
-    const errorFields = ["row.accession", "row.cultivarName", "error"];
-    const errorParser = new Parser({ fields: errorFields, flatten: true });
-    const errorCsv = errorParser.parse(errors);
-    fs.writeFileSync(path.join(logsDir, "upload_errors.csv"), errorCsv);
-  }
-
-  res.json({
-    message: "CSV processed",
-    insertedCount: inserted.length,
-    skippedCount: errors.length,
-    errors
-  });
+      res.json({ message: "CSV processed", insertedCount: inserted.length, skippedCount: errors.length, errors });
+    });
 });
 
+// Download error logs
 app.get("/apples/upload/errors", (req, res) => {
   const errorFile = "logs/upload_errors.csv";
-
-  if (!fs.existsSync(errorFile)) {
-    return res.status(404).json({ error: "No error log found" });
-  }
-
+  if (!fs.existsSync(errorFile)) return res.status(404).json({ error: "No error log found" });
   res.download(errorFile, "upload_errors.csv");
 });
 
-// CSV Export Route
-// CSV Export Route with filtering, sorting, and pagination
+// Export filtered apples as CSV with pagination and sorting
 app.get("/apples/export", async (req, res) => {
   try {
     const {
-      cultivarName,
-      accession,
-      originCountry,
-      originProvince,
-      originCity,
-      genus,
-      species,
-      pedigree,
-      harvestDate,
-      sortBy = "cultivarName",
-      order = "asc",
-      page = 1,
-      limit = 10
+      cultivarName, accession, originCountry, originProvince, originCity,
+      genus, species, pedigree, harvestDate, sortBy = "cultivarName",
+      order = "asc", page = 1, limit = 10
     } = req.query;
 
     const baseFilter = {};
@@ -261,22 +289,8 @@ app.get("/apples/export", async (req, res) => {
     if (harvestDate) baseFilter.harvestDate = harvestDate;
 
     const apples = await Apple.aggregate([
-      {
-        $lookup: {
-          from: "Origin",
-          localField: "originId",
-          foreignField: "_id",
-          as: "origin"
-        }
-      },
-      {
-        $lookup: {
-          from: "AppleProfile",
-          localField: "appleProfileId",
-          foreignField: "_id",
-          as: "profile"
-        }
-      },
+      { $lookup: { from: "Origin", localField: "originId", foreignField: "_id", as: "origin" } },
+      { $lookup: { from: "AppleProfile", localField: "appleProfileId", foreignField: "_id", as: "profile" } },
       { $unwind: "$origin" },
       { $unwind: "$profile" },
       {
@@ -295,24 +309,14 @@ app.get("/apples/export", async (req, res) => {
       { $limit: parseInt(limit) }
     ]);
 
-    if (!apples.length) {
-      return res.status(404).json({ error: "No apples found to export" });
-    }
+    if (!apples.length) return res.status(404).json({ error: "No apples found to export" });
 
     const fields = [
-      "accession",
-      "cultivarName",
-      "harvestDate",
-      "tasteNotes",
-      "notes",
-      "appleProfileId",
-      "physicalAttributesId",
-      "originId"
+      "accession", "cultivarName", "harvestDate", "tasteNotes", "notes",
+      "appleProfileId", "physicalAttributesId", "originId"
     ];
 
-    const json2csvParser = new Parser({ fields });
-    const csv = json2csvParser.parse(apples);
-
+    const csv = new Parser({ fields }).parse(apples);
     res.header("Content-Type", "text/csv");
     res.attachment("filtered_apple_data.csv");
     res.send(csv);
@@ -321,7 +325,6 @@ app.get("/apples/export", async (req, res) => {
     res.status(500).json({ error: "Failed to export apples" });
   }
 });
-
 
 // Start server
 const PORT = process.env.PORT || 3000;
